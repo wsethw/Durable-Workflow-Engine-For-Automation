@@ -1,0 +1,39 @@
+{
+  "info": {
+    "name": "AetherFlow Examples",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "Create Definition",
+      "request": {
+        "method": "POST",
+        "header": [{"key": "Content-Type", "value": "application/json"}],
+        "url": "http://localhost:8080/definitions",
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"name\": \"Order Processing Saga\",\n  \"version\": 1,\n  \"steps\": [\n    {\"id\": \"reserve_inventory\", \"type\": \"http_request\", \"config\": {\"url\": \"https://httpbin.org/post\", \"method\": \"POST\", \"body\": {\"items\": \"{{.input.order.items}}\"}}, \"retry\": {\"max_retries\": 3, \"initial_interval\": \"1s\", \"max_interval\": \"10s\", \"multiplier\": 2.0}, \"on_failure\": \"release_inventory\"},\n    {\"id\": \"process_payment\", \"type\": \"http_request\", \"config\": {\"url\": \"https://httpbin.org/post\", \"method\": \"POST\", \"body\": {\"amount\": \"{{.input.order.amount}}\"}}, \"retry\": {\"max_retries\": 2, \"initial_interval\": \"500ms\"}, \"on_failure\": \"reverse_payment\"},\n    {\"id\": \"release_inventory\", \"type\": \"http_request\", \"config\": {\"url\": \"https://httpbin.org/post\", \"method\": \"POST\", \"body\": {\"reservation_id\": \"{{.steps.reserve_inventory.body.reservation_id}}\"}}},\n    {\"id\": \"reverse_payment\", \"type\": \"http_request\", \"config\": {\"url\": \"https://httpbin.org/post\", \"method\": \"POST\", \"body\": {\"charge_id\": \"{{.steps.process_payment.body.charge_id}}\"}}},\n    {\"id\": \"notify_customer\", \"type\": \"condition\", \"config\": {\"if\": \"steps.process_payment.status == 'completed'\", \"then\": \"send_email\", \"else\": null}},\n    {\"id\": \"send_email\", \"type\": \"http_request\", \"config\": {\"url\": \"https://httpbin.org/post\", \"method\": \"POST\", \"body\": {\"to\": \"{{.input.order.customer_email}}\", \"template\": \"order_confirmation\"}}}\n  ]\n}"
+        }
+      }
+    },
+    {
+      "name": "Start Instance",
+      "request": {
+        "method": "POST",
+        "header": [{"key": "Content-Type", "value": "application/json"}],
+        "url": "http://localhost:8080/instances",
+        "body": {
+          "mode": "raw",
+          "raw": "{\"definition_id\":\"{{definition_id}}\",\"input\":{\"order\":{\"items\":[{\"sku\":\"abc\",\"qty\":1}],\"amount\":4200,\"customer_email\":\"customer@example.com\"},\"payment\":{\"token\":\"tok_test\"},\"token\":\"demo-token\"}}"
+        }
+      }
+    },
+    {
+      "name": "Get Instance",
+      "request": {
+        "method": "GET",
+        "url": "http://localhost:8080/instances/{{instance_id}}"
+      }
+    }
+  ]
+}
