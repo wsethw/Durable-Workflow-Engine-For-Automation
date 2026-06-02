@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/aetherflow/aetherflow/internal/store"
 	"github.com/aetherflow/aetherflow/internal/workflow"
@@ -50,7 +51,10 @@ func TestHTTPRequestRendersTemplatesAndPreservesJSONValues(t *testing.T) {
 		},
 	}
 
-	result, err := NewExecutor(server.Client()).Execute(context.Background(), instance, step)
+	result, err := NewExecutorWithOptions(ExecutorOptions{
+		HTTPClient:           server.Client(),
+		AllowPrivateNetworks: true,
+	}).Execute(context.Background(), instance, step)
 	if err != nil {
 		t.Fatalf("execute http request: %v", err)
 	}
@@ -105,5 +109,44 @@ func TestDelayReturnsWaitingTimerThenCompletesAfterRehydrate(t *testing.T) {
 	}
 	if result.Output["fired_at"] == "" {
 		t.Fatalf("expected fired_at output, got %#v", result.Output)
+	}
+}
+
+func TestDelayDoesNotCompleteBeforePersistedFireTime(t *testing.T) {
+	fireAt := time.Now().UTC().Add(time.Hour)
+	instance := &store.Instance{State: workflow.NewRuntimeState()}
+	instance.State.Steps["delay"] = workflow.StepState{Status: workflow.StepWaitingTimer, WaitingTime: &fireAt}
+	step := workflow.Step{ID: "delay", Type: workflow.StepDelay, Config: map[string]any{"duration": "10ms"}}
+
+	result, err := NewExecutor(nil).Execute(context.Background(), instance, step)
+	if err == nil {
+		t.Fatal("expected waiting timer error")
+	}
+	waiting, ok := IsWaitingTimer(err)
+	if !ok {
+		t.Fatalf("expected waiting timer error, got %v", err)
+	}
+	if !waiting.FireAt.Equal(fireAt) {
+		t.Fatalf("expected persisted fire time %s, got %s", fireAt, waiting.FireAt)
+	}
+	if result == nil || result.DelayUntil == nil || !result.DelayUntil.Equal(fireAt) {
+		t.Fatalf("expected persisted delay result, got %#v", result)
+	}
+}
+
+func TestHTTPRequestBlocksPrivateNetworkByDefault(t *testing.T) {
+	instance := &store.Instance{Input: map[string]any{}, State: workflow.NewRuntimeState()}
+	step := workflow.Step{
+		ID:   "private",
+		Type: workflow.StepHTTPRequest,
+		Config: map[string]any{
+			"url":    "http://127.0.0.1:8080/private",
+			"method": "GET",
+		},
+	}
+
+	_, err := NewExecutor(nil).Execute(context.Background(), instance, step)
+	if err == nil {
+		t.Fatal("expected private network validation error")
 	}
 }

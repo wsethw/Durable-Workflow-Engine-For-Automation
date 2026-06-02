@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"time"
 
@@ -22,22 +23,27 @@ type Handler struct {
 	redis     *redis.Client
 	engine    *engine.Engine
 	validator dsl.Validator
+	options   Options
 }
 
-func New(repo store.Repository, redisClient *redis.Client, engine *engine.Engine, validator dsl.Validator) *Handler {
-	return &Handler{repo: repo, redis: redisClient, engine: engine, validator: validator}
+func New(repo store.Repository, redisClient *redis.Client, engine *engine.Engine, validator dsl.Validator, options Options) *Handler {
+	return &Handler{repo: repo, redis: redisClient, engine: engine, validator: validator, options: options}
 }
 
 func (h *Handler) Router() http.Handler {
 	router := gin.New()
 	router.Use(gin.Recovery())
 	router.Use(requestLogger())
+	router.Use(limitBody(h.options.MaxBodyBytes))
 
 	router.GET("/healthz", h.healthz)
 	router.GET("/readyz", h.readyz)
-	router.POST("/definitions", h.createDefinition)
-	router.POST("/instances", h.createInstance)
-	router.GET("/instances/:id", h.getInstance)
+
+	protected := router.Group("/")
+	protected.Use(authenticate(h.options.APIKeys))
+	protected.POST("/definitions", requireRole(roleAdmin), h.createDefinition)
+	protected.POST("/instances", requireRole(roleAdmin, roleOperator), h.createInstance)
+	protected.GET("/instances/:id", requireRole(roleAdmin, roleOperator, roleReader), h.getInstance)
 	return router
 }
 
@@ -69,13 +75,15 @@ func (h *Handler) createDefinition(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	definition, err := h.repo.CreateDefinition(c.Request.Context(), request)
+	principal := currentPrincipal(c)
+	definition, err := h.repo.CreateDefinition(c.Request.Context(), principal.TenantID, request)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 	c.JSON(http.StatusCreated, gin.H{
 		"id":         definition.ID,
+		"tenant_id":  definition.TenantID,
 		"name":       definition.Name,
 		"version":    definition.Version,
 		"created_at": definition.CreatedAt,
@@ -100,7 +108,8 @@ func (h *Handler) createInstance(c *gin.Context) {
 	if request.Input == nil {
 		request.Input = map[string]any{}
 	}
-	definition, err := h.repo.GetDefinition(c.Request.Context(), request.DefinitionID)
+	principal := currentPrincipal(c)
+	definition, err := h.repo.GetDefinitionForTenant(c.Request.Context(), principal.TenantID, request.DefinitionID)
 	if err != nil {
 		status := http.StatusInternalServerError
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -109,7 +118,7 @@ func (h *Handler) createInstance(c *gin.Context) {
 		c.JSON(status, gin.H{"error": err.Error()})
 		return
 	}
-	instance, err := h.repo.CreateInstance(c.Request.Context(), definition, request.Input)
+	instance, err := h.repo.CreateInstance(c.Request.Context(), principal.TenantID, definition, request.Input)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -120,6 +129,7 @@ func (h *Handler) createInstance(c *gin.Context) {
 	}
 	c.JSON(http.StatusAccepted, gin.H{
 		"id":                 instance.ID,
+		"tenant_id":          instance.TenantID,
 		"definition_id":      instance.DefinitionID,
 		"definition_version": instance.DefinitionVersion,
 		"status":             instance.Status,
@@ -128,7 +138,8 @@ func (h *Handler) createInstance(c *gin.Context) {
 
 func (h *Handler) getInstance(c *gin.Context) {
 	instanceID := c.Param("id")
-	instance, err := h.repo.GetInstance(c.Request.Context(), instanceID)
+	principal := currentPrincipal(c)
+	instance, err := h.repo.GetInstanceForTenant(c.Request.Context(), principal.TenantID, instanceID)
 	if err != nil {
 		status := http.StatusInternalServerError
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -144,6 +155,7 @@ func (h *Handler) getInstance(c *gin.Context) {
 	}
 	c.JSON(http.StatusOK, gin.H{
 		"id":                 instance.ID,
+		"tenant_id":          instance.TenantID,
 		"definition_id":      instance.DefinitionID,
 		"definition_version": instance.DefinitionVersion,
 		"status":             instance.Status,
@@ -161,6 +173,11 @@ func requestLogger() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		start := time.Now()
 		c.Next()
-		gin.DefaultWriter.Write([]byte(fmt.Sprintf("%s %s %d %s\n", c.Request.Method, c.Request.URL.Path, c.Writer.Status(), time.Since(start))))
+		slog.Info("http request",
+			"method", c.Request.Method,
+			"path", c.Request.URL.Path,
+			"status", c.Writer.Status(),
+			"duration", time.Since(start),
+		)
 	}
 }

@@ -78,22 +78,37 @@ func run() error {
 	cancel()
 
 	metrics := telemetry.NewMetrics()
-	executor := worker.NewExecutor(&http.Client{Timeout: 15 * time.Second})
+	executor := worker.NewExecutorWithOptions(worker.ExecutorOptions{
+		HTTPClient:           &http.Client{Timeout: 15 * time.Second},
+		AllowPrivateNetworks: cfg.AllowPrivateHTTP,
+		MaxRequestBytes:      cfg.MaxRequestBytes,
+		MaxResponseBytes:     cfg.MaxRequestBytes,
+	})
+	if cfg.APIKeys == "" {
+		logger.Warn("API_KEYS is empty; API authentication is running in local default-admin mode")
+	}
 
 	var timerService *timer.Service
 	workflowEngine := engine.New(repo, redisClient, executor, nil, metrics, logger, engine.Config{
 		Stream:      cfg.RedisStream,
 		Group:       cfg.RedisGroup,
 		Concurrency: cfg.WorkerConcurrency,
+		Lease:       cfg.WorkerLease,
+		PendingIdle: cfg.RedisPendingIdle,
 	})
 	timerService = timer.New(repo, redisClient, workflowEngine.Enqueue, logger, timer.Config{RedisDB: cfg.RedisDB})
 	workflowEngine = engine.New(repo, redisClient, executor, timerService, metrics, logger, engine.Config{
 		Stream:      cfg.RedisStream,
 		Group:       cfg.RedisGroup,
 		Concurrency: cfg.WorkerConcurrency,
+		Lease:       cfg.WorkerLease,
+		PendingIdle: cfg.RedisPendingIdle,
 	})
 
-	apiHandler := api.New(repo, redisClient, workflowEngine, dsl.NewValidator())
+	apiHandler := api.New(repo, redisClient, workflowEngine, dsl.NewValidatorWithOptions(dsl.Options{AllowPrivateHTTP: cfg.AllowPrivateHTTP}), api.Options{
+		APIKeys:      api.ParseAPIKeys(cfg.APIKeys),
+		MaxBodyBytes: cfg.MaxRequestBytes,
+	})
 	apiServer := &http.Server{
 		Addr:              cfg.HTTPAddr,
 		Handler:           apiHandler.Router(),

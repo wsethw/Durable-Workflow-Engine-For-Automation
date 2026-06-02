@@ -4,22 +4,32 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"net/url"
 	"strings"
 	"time"
 
 	"github.com/expr-lang/expr"
 
+	"github.com/aetherflow/aetherflow/internal/security"
 	"github.com/aetherflow/aetherflow/internal/workflow"
 )
 
-type Validator struct{}
+type Validator struct {
+	allowPrivateHTTP bool
+}
+
+type Options struct {
+	AllowPrivateHTTP bool
+}
 
 func NewValidator() Validator {
 	return Validator{}
 }
 
-func (Validator) Validate(ctx context.Context, definition workflow.DefinitionDSL) error {
+func NewValidatorWithOptions(options Options) Validator {
+	return Validator{allowPrivateHTTP: options.AllowPrivateHTTP}
+}
+
+func (v Validator) Validate(ctx context.Context, definition workflow.DefinitionDSL) error {
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("validate workflow context: %w", err)
 	}
@@ -42,7 +52,7 @@ func (Validator) Validate(ctx context.Context, definition workflow.DefinitionDSL
 			return fmt.Errorf("validate workflow: duplicate step id %q", step.ID)
 		}
 		ids[step.ID] = i
-		if err := validateStep(step); err != nil {
+		if err := v.validateStep(step); err != nil {
 			return fmt.Errorf("validate step %q: %w", step.ID, err)
 		}
 	}
@@ -66,19 +76,15 @@ func (Validator) Validate(ctx context.Context, definition workflow.DefinitionDSL
 	return nil
 }
 
-func validateStep(step workflow.Step) error {
+func (v Validator) validateStep(step workflow.Step) error {
 	switch step.Type {
 	case workflow.StepHTTPRequest:
 		rawURL, ok := stringValue(step.Config, "url")
 		if !ok || strings.TrimSpace(rawURL) == "" {
 			return fmt.Errorf("http_request requires config.url")
 		}
-		parsed, err := url.Parse(rawURL)
-		if err != nil {
-			return fmt.Errorf("parse http_request url: %w", err)
-		}
-		if parsed.Scheme != "http" && parsed.Scheme != "https" {
-			return fmt.Errorf("http_request url must use http or https")
+		if _, err := security.ValidateHTTPURL(rawURL, v.allowPrivateHTTP); err != nil {
+			return fmt.Errorf("validate http_request url: %w", err)
 		}
 		method, ok := stringValue(step.Config, "method")
 		if !ok || strings.TrimSpace(method) == "" {
@@ -86,6 +92,15 @@ func validateStep(step workflow.Step) error {
 		}
 		if !isHTTPMethod(method) {
 			return fmt.Errorf("unsupported http method %q", method)
+		}
+		if timeout, ok := firstString(step.Config, "timeout"); ok {
+			parsed, err := time.ParseDuration(timeout)
+			if err != nil {
+				return fmt.Errorf("parse http_request timeout: %w", err)
+			}
+			if parsed <= 0 || parsed > 15*time.Second {
+				return fmt.Errorf("http_request timeout must be between 1ns and 15s")
+			}
 		}
 	case workflow.StepTransform:
 		expression, ok := firstString(step.Config, "expr", "expression")
@@ -116,6 +131,13 @@ func validateStep(step workflow.Step) error {
 		if !ok || len(branches) == 0 {
 			return fmt.Errorf("fork requires config.branches")
 		}
+		seen := make(map[string]struct{}, len(branches))
+		for _, branch := range branches {
+			if _, duplicate := seen[branch]; duplicate {
+				return fmt.Errorf("fork branch %q is duplicated", branch)
+			}
+			seen[branch] = struct{}{}
+		}
 	case workflow.StepJoin:
 		return nil
 	default:
@@ -127,14 +149,25 @@ func validateStep(step workflow.Step) error {
 			return fmt.Errorf("retry.max_retries must be >= 0")
 		}
 		if step.Retry.InitialInterval != "" {
-			if _, err := time.ParseDuration(step.Retry.InitialInterval); err != nil {
+			duration, err := time.ParseDuration(step.Retry.InitialInterval)
+			if err != nil {
 				return fmt.Errorf("parse retry.initial_interval: %w", err)
+			}
+			if duration <= 0 {
+				return fmt.Errorf("retry.initial_interval must be positive")
 			}
 		}
 		if step.Retry.MaxInterval != "" {
-			if _, err := time.ParseDuration(step.Retry.MaxInterval); err != nil {
+			duration, err := time.ParseDuration(step.Retry.MaxInterval)
+			if err != nil {
 				return fmt.Errorf("parse retry.max_interval: %w", err)
 			}
+			if duration <= 0 {
+				return fmt.Errorf("retry.max_interval must be positive")
+			}
+		}
+		if step.Retry.Multiplier < 0 {
+			return fmt.Errorf("retry.multiplier must be >= 0")
 		}
 	}
 	return nil

@@ -15,12 +15,29 @@ import (
 
 	"github.com/expr-lang/expr"
 
+	"github.com/aetherflow/aetherflow/internal/security"
 	"github.com/aetherflow/aetherflow/internal/store"
 	"github.com/aetherflow/aetherflow/internal/workflow"
 )
 
+const (
+	defaultHTTPTimeout      = 15 * time.Second
+	defaultMaxRequestBytes  = 1 << 20
+	defaultMaxResponseBytes = 2 << 20
+)
+
 type Executor struct {
-	httpClient *http.Client
+	httpClient           *http.Client
+	allowPrivateNetworks bool
+	maxRequestBytes      int64
+	maxResponseBytes     int64
+}
+
+type ExecutorOptions struct {
+	HTTPClient           *http.Client
+	AllowPrivateNetworks bool
+	MaxRequestBytes      int64
+	MaxResponseBytes     int64
 }
 
 type Result struct {
@@ -39,13 +56,29 @@ func (e WaitingTimerError) Error() string {
 }
 
 func NewExecutor(httpClient *http.Client) *Executor {
+	return NewExecutorWithOptions(ExecutorOptions{HTTPClient: httpClient})
+}
+
+func NewExecutorWithOptions(options ExecutorOptions) *Executor {
+	httpClient := options.HTTPClient
 	if httpClient == nil {
-		httpClient = &http.Client{Timeout: 15 * time.Second}
+		httpClient = &http.Client{Timeout: defaultHTTPTimeout}
 	}
 	if httpClient.Timeout <= 0 {
-		httpClient.Timeout = 15 * time.Second
+		httpClient.Timeout = defaultHTTPTimeout
 	}
-	return &Executor{httpClient: httpClient}
+	if options.MaxRequestBytes <= 0 {
+		options.MaxRequestBytes = defaultMaxRequestBytes
+	}
+	if options.MaxResponseBytes <= 0 {
+		options.MaxResponseBytes = defaultMaxResponseBytes
+	}
+	return &Executor{
+		httpClient:           httpClient,
+		allowPrivateNetworks: options.AllowPrivateNetworks,
+		maxRequestBytes:      options.MaxRequestBytes,
+		maxResponseBytes:     options.MaxResponseBytes,
+	}
 }
 
 func (e *Executor) Execute(ctx context.Context, instance *store.Instance, step workflow.Step) (*Result, error) {
@@ -83,6 +116,9 @@ func (e *Executor) executeHTTPRequest(ctx context.Context, step workflow.Step, e
 	if rawURL == "" || method == "" {
 		return nil, fmt.Errorf("execute http_request: url and method are required")
 	}
+	if err := security.EnsureHTTPDestinationAllowed(ctx, rawURL, e.allowPrivateNetworks); err != nil {
+		return nil, fmt.Errorf("validate http_request destination: %w", err)
+	}
 	method = strings.ToUpper(method)
 
 	var bodyReader io.Reader
@@ -91,10 +127,24 @@ func (e *Executor) executeHTTPRequest(ctx context.Context, step workflow.Step, e
 		if err != nil {
 			return nil, fmt.Errorf("marshal http_request body: %w", err)
 		}
+		if int64(len(bodyRaw)) > e.maxRequestBytes {
+			return nil, fmt.Errorf("http_request body exceeds %d bytes", e.maxRequestBytes)
+		}
 		bodyReader = bytes.NewReader(bodyRaw)
 	}
 
-	requestCtx, cancel := context.WithTimeout(ctx, e.httpClient.Timeout)
+	timeout := e.httpClient.Timeout
+	if configuredTimeout, ok := firstString(config, "timeout"); ok && configuredTimeout != "" {
+		parsed, err := time.ParseDuration(configuredTimeout)
+		if err != nil {
+			return nil, fmt.Errorf("parse http_request timeout: %w", err)
+		}
+		if parsed <= 0 || parsed > e.httpClient.Timeout {
+			return nil, fmt.Errorf("http_request timeout must be between 1ns and %s", e.httpClient.Timeout)
+		}
+		timeout = parsed
+	}
+	requestCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(requestCtx, method, rawURL, bodyReader)
 	if err != nil {
@@ -115,9 +165,12 @@ func (e *Executor) executeHTTPRequest(ctx context.Context, step workflow.Step, e
 	}
 	defer resp.Body.Close()
 
-	rawBody, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+	rawBody, err := io.ReadAll(io.LimitReader(resp.Body, e.maxResponseBytes+1))
 	if err != nil {
 		return nil, fmt.Errorf("read http_response body: %w", err)
+	}
+	if int64(len(rawBody)) > e.maxResponseBytes {
+		return nil, fmt.Errorf("http_response body exceeds %d bytes", e.maxResponseBytes)
 	}
 	var parsedBody any
 	if len(rawBody) > 0 {
@@ -172,6 +225,13 @@ func (e *Executor) executeDelay(ctx context.Context, instance *store.Instance, s
 	default:
 	}
 	if current, ok := instance.State.Steps[step.ID]; ok && current.Status == workflow.StepWaitingTimer {
+		if current.WaitingTime != nil && current.WaitingTime.After(time.Now().UTC()) {
+			return &Result{
+				Output:     map[string]any{"fire_at": current.WaitingTime.Format(time.RFC3339Nano)},
+				Body:       map[string]any{"waiting": true},
+				DelayUntil: current.WaitingTime,
+			}, WaitingTimerError{FireAt: *current.WaitingTime}
+		}
 		return &Result{
 			Output: map[string]any{"fired_at": time.Now().UTC().Format(time.RFC3339Nano)},
 			Body:   map[string]any{"fired": true},

@@ -23,6 +23,10 @@ Services:
 - `POST /instances` starts an instance from a `definition_id`.
 - `GET /instances/:id` returns current state, history, and payload.
 
+API authentication is enabled when `API_KEYS` is set. Use comma-separated entries in the form
+`token=tenant_id:role`, where role is `admin`, `operator`, or `reader`. When `API_KEYS` is empty,
+the service runs in local development mode as `default/admin`.
+
 ## Example
 
 Create a definition:
@@ -118,3 +122,5 @@ curl -sS http://localhost:8080/instances/<instance_id>
 Each step is recorded as `running` before execution. Outputs and instance state are persisted before the next task is enqueued. On restart, workers consume the durable Redis stream and rehydrate instance state from PostgreSQL; the recovery loop also re-enqueues instances left in `running` or `waiting_timer`.
 
 Retries use per-step exponential backoff. A step with `on_failure` runs compensation steps in reverse completion order when the normal path cannot recover. Definition updates are versioned by `(name, version)`, and instances keep `definition_version`, so in-flight executions remain tied to their original definition snapshot.
+
+Distributed workers claim instances through PostgreSQL leases before advancing state. Redis Stream messages are acknowledged only after a successful transition or a confirmed duplicate claim, and stale pending messages are reclaimed with `XAUTOCLAIM`. Durable timers are claimed atomically before enqueueing to avoid duplicate wakeups. HTTP workflow steps reject local/private destinations by default; set `ALLOW_PRIVATE_HTTP=true` only for trusted internal deployments.

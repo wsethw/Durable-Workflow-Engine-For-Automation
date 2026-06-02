@@ -37,6 +37,11 @@ services:
       REDIS_STREAM: "aetherflow:tasks"
       REDIS_GROUP: "aetherflow-workers"
       OTLP_ENDPOINT: ""
+      API_KEYS: ""
+      MAX_REQUEST_BYTES: "1048576"
+      ALLOW_PRIVATE_HTTP: "false"
+      WORKER_LEASE: "2m"
+      REDIS_PENDING_IDLE: "30s"
       WORKER_CONCURRENCY: "4"
     depends_on:
       postgres:

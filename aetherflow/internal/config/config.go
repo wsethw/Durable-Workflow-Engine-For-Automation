@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -17,7 +18,12 @@ type Config struct {
 	RedisStream       string
 	RedisGroup        string
 	OTLPEndpoint      string
+	APIKeys           string
 	WorkerConcurrency int
+	MaxRequestBytes   int64
+	AllowPrivateHTTP  bool
+	WorkerLease       time.Duration
+	RedisPendingIdle  time.Duration
 	ShutdownTimeout   time.Duration
 }
 
@@ -31,7 +37,12 @@ func Load() (Config, error) {
 		RedisStream:       env("REDIS_STREAM", "aetherflow:tasks"),
 		RedisGroup:        env("REDIS_GROUP", "aetherflow-workers"),
 		OTLPEndpoint:      env("OTLP_ENDPOINT", ""),
+		APIKeys:           env("API_KEYS", ""),
 		WorkerConcurrency: envInt("WORKER_CONCURRENCY", 4),
+		MaxRequestBytes:   envInt64("MAX_REQUEST_BYTES", 1<<20),
+		AllowPrivateHTTP:  envBool("ALLOW_PRIVATE_HTTP", false),
+		WorkerLease:       envDuration("WORKER_LEASE", 2*time.Minute),
+		RedisPendingIdle:  envDuration("REDIS_PENDING_IDLE", 30*time.Second),
 		RedisDB:           envInt("REDIS_DB", 0),
 		ShutdownTimeout:   envDuration("SHUTDOWN_TIMEOUT", 20*time.Second),
 	}
@@ -61,13 +72,40 @@ func envInt(key string, fallback int) int {
 	return parsed
 }
 
+func envInt64(key string, fallback int64) int64 {
+	value := os.Getenv(key)
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || parsed <= 0 {
+		return fallback
+	}
+	return parsed
+}
+
+func envBool(key string, fallback bool) bool {
+	value := strings.ToLower(strings.TrimSpace(os.Getenv(key)))
+	if value == "" {
+		return fallback
+	}
+	switch value {
+	case "1", "true", "yes", "y", "on":
+		return true
+	case "0", "false", "no", "n", "off":
+		return false
+	default:
+		return fallback
+	}
+}
+
 func envDuration(key string, fallback time.Duration) time.Duration {
 	value := os.Getenv(key)
 	if value == "" {
 		return fallback
 	}
 	parsed, err := time.ParseDuration(value)
-	if err != nil {
+	if err != nil || parsed <= 0 {
 		return fallback
 	}
 	return parsed

@@ -30,22 +30,26 @@ func (p *Postgres) Ping(ctx context.Context) error {
 	return nil
 }
 
-func (p *Postgres) CreateDefinition(ctx context.Context, dsl workflow.DefinitionDSL) (*Definition, error) {
+func (p *Postgres) CreateDefinition(ctx context.Context, tenantID string, dsl workflow.DefinitionDSL) (*Definition, error) {
 	queryCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
+	if tenantID == "" {
+		tenantID = "default"
+	}
 
 	raw, err := json.Marshal(dsl)
 	if err != nil {
 		return nil, fmt.Errorf("marshal definition dsl: %w", err)
 	}
 
-	definition := &Definition{DSL: dsl}
+	definition := &Definition{TenantID: tenantID, DSL: dsl}
 	err = p.pool.QueryRow(queryCtx, `
-		INSERT INTO definitions (name, version, dsl)
-		VALUES ($1, $2, $3)
-		RETURNING id, name, version, created_at, updated_at
-	`, dsl.Name, dsl.Version, raw).Scan(
+		INSERT INTO definitions (tenant_id, name, version, dsl)
+		VALUES ($1, $2, $3, $4)
+		RETURNING id, tenant_id, name, version, created_at, updated_at
+	`, tenantID, dsl.Name, dsl.Version, raw).Scan(
 		&definition.ID,
+		&definition.TenantID,
 		&definition.Name,
 		&definition.Version,
 		&definition.CreatedAt,
@@ -64,11 +68,12 @@ func (p *Postgres) GetDefinition(ctx context.Context, id string) (*Definition, e
 	var raw []byte
 	definition := &Definition{}
 	err := p.pool.QueryRow(queryCtx, `
-		SELECT id, name, version, dsl, created_at, updated_at
+		SELECT id, tenant_id, name, version, dsl, created_at, updated_at
 		FROM definitions
 		WHERE id = $1
 	`, id).Scan(
 		&definition.ID,
+		&definition.TenantID,
 		&definition.Name,
 		&definition.Version,
 		&raw,
@@ -87,9 +92,46 @@ func (p *Postgres) GetDefinition(ctx context.Context, id string) (*Definition, e
 	return definition, nil
 }
 
-func (p *Postgres) CreateInstance(ctx context.Context, definition *Definition, input map[string]any) (*Instance, error) {
+func (p *Postgres) GetDefinitionForTenant(ctx context.Context, tenantID string, id string) (*Definition, error) {
 	queryCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
+	if tenantID == "" {
+		tenantID = "default"
+	}
+
+	var raw []byte
+	definition := &Definition{}
+	err := p.pool.QueryRow(queryCtx, `
+		SELECT id, tenant_id, name, version, dsl, created_at, updated_at
+		FROM definitions
+		WHERE tenant_id = $1 AND id = $2
+	`, tenantID, id).Scan(
+		&definition.ID,
+		&definition.TenantID,
+		&definition.Name,
+		&definition.Version,
+		&raw,
+		&definition.CreatedAt,
+		&definition.UpdatedAt,
+	)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, fmt.Errorf("definition not found: %w", err)
+		}
+		return nil, fmt.Errorf("select tenant definition: %w", err)
+	}
+	if err := json.Unmarshal(raw, &definition.DSL); err != nil {
+		return nil, fmt.Errorf("unmarshal definition dsl: %w", err)
+	}
+	return definition, nil
+}
+
+func (p *Postgres) CreateInstance(ctx context.Context, tenantID string, definition *Definition, input map[string]any) (*Instance, error) {
+	queryCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	if tenantID == "" {
+		tenantID = "default"
+	}
 
 	inputRaw, err := json.Marshal(input)
 	if err != nil {
@@ -103,6 +145,7 @@ func (p *Postgres) CreateInstance(ctx context.Context, definition *Definition, i
 	}
 
 	instance := &Instance{
+		TenantID:          tenantID,
 		DefinitionID:      definition.ID,
 		DefinitionVersion: definition.Version,
 		Status:            workflow.InstancePending,
@@ -110,11 +153,12 @@ func (p *Postgres) CreateInstance(ctx context.Context, definition *Definition, i
 		State:             state,
 	}
 	err = p.pool.QueryRow(queryCtx, `
-		INSERT INTO instances (definition_id, definition_version, status, input, state)
-		VALUES ($1, $2, $3, $4, $5)
-		RETURNING id, version, created_at, updated_at
-	`, definition.ID, definition.Version, workflow.InstancePending, inputRaw, stateRaw).Scan(
+		INSERT INTO instances (tenant_id, definition_id, definition_version, status, input, state)
+		VALUES ($1, $2, $3, $4, $5, $6)
+		RETURNING id, tenant_id, version, created_at, updated_at
+	`, tenantID, definition.ID, definition.Version, workflow.InstancePending, inputRaw, stateRaw).Scan(
 		&instance.ID,
+		&instance.TenantID,
 		&instance.Version,
 		&instance.CreatedAt,
 		&instance.UpdatedAt,
@@ -133,11 +177,12 @@ func (p *Postgres) GetInstance(ctx context.Context, id string) (*Instance, error
 	var inputRaw []byte
 	var stateRaw []byte
 	err := p.pool.QueryRow(queryCtx, `
-		SELECT id, definition_id, definition_version, status, input, current_step_id, state, version, created_at, updated_at
+		SELECT id, tenant_id, definition_id, definition_version, status, input, current_step_id, state, version, created_at, updated_at
 		FROM instances
 		WHERE id = $1
 	`, id).Scan(
 		&instance.ID,
+		&instance.TenantID,
 		&instance.DefinitionID,
 		&instance.DefinitionVersion,
 		&instance.Status,
@@ -164,6 +209,107 @@ func (p *Postgres) GetInstance(ctx context.Context, id string) (*Instance, error
 	return instance, nil
 }
 
+func (p *Postgres) GetInstanceForTenant(ctx context.Context, tenantID string, id string) (*Instance, error) {
+	queryCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	if tenantID == "" {
+		tenantID = "default"
+	}
+
+	instance := &Instance{}
+	var inputRaw []byte
+	var stateRaw []byte
+	err := p.pool.QueryRow(queryCtx, `
+		SELECT id, tenant_id, definition_id, definition_version, status, input, current_step_id, state, version, created_at, updated_at
+		FROM instances
+		WHERE tenant_id = $1 AND id = $2
+	`, tenantID, id).Scan(
+		&instance.ID,
+		&instance.TenantID,
+		&instance.DefinitionID,
+		&instance.DefinitionVersion,
+		&instance.Status,
+		&inputRaw,
+		&instance.CurrentStepID,
+		&stateRaw,
+		&instance.Version,
+		&instance.CreatedAt,
+		&instance.UpdatedAt,
+	)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, fmt.Errorf("instance not found: %w", err)
+		}
+		return nil, fmt.Errorf("select tenant instance: %w", err)
+	}
+	if err := json.Unmarshal(inputRaw, &instance.Input); err != nil {
+		return nil, fmt.Errorf("unmarshal instance input: %w", err)
+	}
+	if err := json.Unmarshal(stateRaw, &instance.State); err != nil {
+		return nil, fmt.Errorf("unmarshal instance state: %w", err)
+	}
+	instance.State.Normalize()
+	return instance, nil
+}
+
+func (p *Postgres) ClaimInstance(ctx context.Context, id string, owner string, leaseUntil time.Time) (*Instance, error) {
+	queryCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+
+	instance := &Instance{}
+	var inputRaw []byte
+	var stateRaw []byte
+	err := p.pool.QueryRow(queryCtx, `
+		UPDATE instances
+		SET locked_by = $2,
+		    locked_until = $3
+		WHERE id = $1
+		  AND status NOT IN ('completed', 'failed')
+		  AND (locked_until IS NULL OR locked_until <= now() OR locked_by = $2)
+		RETURNING id, tenant_id, definition_id, definition_version, status, input, current_step_id, state, version, created_at, updated_at
+	`, id, owner, leaseUntil).Scan(
+		&instance.ID,
+		&instance.TenantID,
+		&instance.DefinitionID,
+		&instance.DefinitionVersion,
+		&instance.Status,
+		&inputRaw,
+		&instance.CurrentStepID,
+		&stateRaw,
+		&instance.Version,
+		&instance.CreatedAt,
+		&instance.UpdatedAt,
+	)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, fmt.Errorf("claim instance: %w", ErrInstanceBusy)
+		}
+		return nil, fmt.Errorf("claim instance: %w", err)
+	}
+	if err := json.Unmarshal(inputRaw, &instance.Input); err != nil {
+		return nil, fmt.Errorf("unmarshal instance input: %w", err)
+	}
+	if err := json.Unmarshal(stateRaw, &instance.State); err != nil {
+		return nil, fmt.Errorf("unmarshal instance state: %w", err)
+	}
+	instance.State.Normalize()
+	return instance, nil
+}
+
+func (p *Postgres) ReleaseInstance(ctx context.Context, id string, owner string) error {
+	queryCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	if _, err := p.pool.Exec(queryCtx, `
+		UPDATE instances
+		SET locked_by = NULL,
+		    locked_until = NULL
+		WHERE id = $1 AND locked_by = $2
+	`, id, owner); err != nil {
+		return fmt.Errorf("release instance: %w", err)
+	}
+	return nil
+}
+
 func (p *Postgres) ListRecoverableInstances(ctx context.Context, limit int) ([]Instance, error) {
 	queryCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
@@ -172,9 +318,10 @@ func (p *Postgres) ListRecoverableInstances(ctx context.Context, limit int) ([]I
 	}
 
 	rows, err := p.pool.Query(queryCtx, `
-		SELECT id, definition_id, definition_version, status, input, current_step_id, state, version, created_at, updated_at
+		SELECT id, tenant_id, definition_id, definition_version, status, input, current_step_id, state, version, created_at, updated_at
 		FROM instances
-		WHERE status IN ('pending', 'running')
+		WHERE status IN ('pending', 'running', 'waiting_timer', 'compensating')
+		  AND (locked_until IS NULL OR locked_until <= now())
 		ORDER BY updated_at ASC
 		LIMIT $1
 	`, limit)
@@ -332,6 +479,25 @@ func (p *Postgres) DeleteTimer(ctx context.Context, instanceID string) error {
 	return nil
 }
 
+func (p *Postgres) FireTimer(ctx context.Context, instanceID string) (*Timer, bool, error) {
+	queryCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+
+	var timer Timer
+	err := p.pool.QueryRow(queryCtx, `
+		DELETE FROM timers
+		WHERE instance_id = $1
+		RETURNING instance_id, step_id, fire_at
+	`, instanceID).Scan(&timer.InstanceID, &timer.StepID, &timer.FireAt)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, false, nil
+		}
+		return nil, false, fmt.Errorf("fire timer: %w", err)
+	}
+	return &timer, true, nil
+}
+
 func (p *Postgres) ListDueTimers(ctx context.Context, now time.Time, limit int) ([]Timer, error) {
 	queryCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
@@ -365,12 +531,53 @@ func (p *Postgres) ListDueTimers(ctx context.Context, now time.Time, limit int) 
 	return timers, nil
 }
 
+func (p *Postgres) ClaimDueTimers(ctx context.Context, now time.Time, limit int) ([]Timer, error) {
+	queryCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if limit <= 0 {
+		limit = 100
+	}
+
+	rows, err := p.pool.Query(queryCtx, `
+		WITH due AS (
+			SELECT instance_id, step_id, fire_at
+			FROM timers
+			WHERE fire_at <= $1
+			ORDER BY fire_at ASC
+			LIMIT $2
+			FOR UPDATE SKIP LOCKED
+		)
+		DELETE FROM timers
+		USING due
+		WHERE timers.instance_id = due.instance_id
+		RETURNING due.instance_id, due.step_id, due.fire_at
+	`, now, limit)
+	if err != nil {
+		return nil, fmt.Errorf("claim due timers: %w", err)
+	}
+	defer rows.Close()
+
+	timers := make([]Timer, 0)
+	for rows.Next() {
+		var timer Timer
+		if err := rows.Scan(&timer.InstanceID, &timer.StepID, &timer.FireAt); err != nil {
+			return nil, fmt.Errorf("scan claimed timer: %w", err)
+		}
+		timers = append(timers, timer)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate claimed timers: %w", err)
+	}
+	return timers, nil
+}
+
 func scanInstance(rows pgx.Rows) (*Instance, error) {
 	instance := &Instance{}
 	var inputRaw []byte
 	var stateRaw []byte
 	if err := rows.Scan(
 		&instance.ID,
+		&instance.TenantID,
 		&instance.DefinitionID,
 		&instance.DefinitionVersion,
 		&instance.Status,

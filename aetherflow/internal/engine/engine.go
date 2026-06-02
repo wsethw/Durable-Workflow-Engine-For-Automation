@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -37,6 +38,9 @@ type Engine struct {
 	metrics     *telemetry.Metrics
 	logger      *slog.Logger
 	concurrency int
+	lease       time.Duration
+	pendingIdle time.Duration
+	claimSeq    atomic.Uint64
 }
 
 type Config struct {
@@ -44,6 +48,8 @@ type Config struct {
 	Group       string
 	Consumer    string
 	Concurrency int
+	Lease       time.Duration
+	PendingIdle time.Duration
 }
 
 func New(repo store.Repository, redisClient *redis.Client, executor *worker.Executor, timers TimerScheduler, metrics *telemetry.Metrics, logger *slog.Logger, config Config) *Engine {
@@ -60,6 +66,12 @@ func New(repo store.Repository, redisClient *redis.Client, executor *worker.Exec
 	if config.Concurrency <= 0 {
 		config.Concurrency = 4
 	}
+	if config.Lease <= 0 {
+		config.Lease = 2 * time.Minute
+	}
+	if config.PendingIdle <= 0 {
+		config.PendingIdle = 30 * time.Second
+	}
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -74,6 +86,8 @@ func New(repo store.Repository, redisClient *redis.Client, executor *worker.Exec
 		metrics:     metrics,
 		logger:      logger,
 		concurrency: config.Concurrency,
+		lease:       config.Lease,
+		pendingIdle: config.PendingIdle,
 	}
 }
 
@@ -130,13 +144,21 @@ func (e *Engine) Recover(ctx context.Context) error {
 }
 
 func (e *Engine) Advance(ctx context.Context, instanceID string) error {
-	instance, err := e.repo.GetInstance(ctx, instanceID)
+	owner := e.nextClaimOwner()
+	instance, err := e.repo.ClaimInstance(ctx, instanceID, owner, time.Now().UTC().Add(e.lease))
 	if err != nil {
-		return fmt.Errorf("get instance for advance: %w", err)
+		return fmt.Errorf("claim instance for advance: %w", err)
 	}
-	if isTerminal(instance.Status) {
-		return nil
+	defer func() {
+		if err := e.repo.ReleaseInstance(context.Background(), instanceID, owner); err != nil {
+			e.logger.Error("release workflow instance lease", "instance_id", instanceID, "owner", owner, "error", err)
+		}
+	}()
+
+	if handled, err := e.ensureWaitingTimer(ctx, instance); handled || err != nil {
+		return err
 	}
+
 	definition, err := e.repo.GetDefinition(ctx, instance.DefinitionID)
 	if err != nil {
 		return fmt.Errorf("get definition for advance: %w", err)
@@ -154,8 +176,27 @@ func (e *Engine) Advance(ctx context.Context, instanceID string) error {
 	return e.executeNormalStep(ctx, instance, definition, machine, step)
 }
 
+func (e *Engine) ensureWaitingTimer(ctx context.Context, instance *store.Instance) (bool, error) {
+	if instance.Status != workflow.InstanceWaitingTimer || instance.CurrentStepID == nil {
+		return false, nil
+	}
+	state := instance.State.Steps[*instance.CurrentStepID]
+	if state.WaitingTime == nil || !state.WaitingTime.After(time.Now().UTC()) {
+		return false, nil
+	}
+	if e.timers == nil {
+		return true, fmt.Errorf("instance %s is waiting on timer but no timer scheduler is configured", instance.ID)
+	}
+	if err := e.timers.Schedule(ctx, store.Timer{InstanceID: instance.ID, StepID: *instance.CurrentStepID, FireAt: *state.WaitingTime}); err != nil {
+		return true, fmt.Errorf("reschedule waiting timer: %w", err)
+	}
+	e.logger.Info("workflow timer rescheduled", "instance_id", instance.ID, "step_id", *instance.CurrentStepID, "fire_at", *state.WaitingTime)
+	return true, nil
+}
+
 func (e *Engine) executeNormalStep(ctx context.Context, instance *store.Instance, definition *store.Definition, machine Machine, step workflow.Step) error {
 	attempt := instance.State.Steps[step.ID].Attempt + 1
+	previousStepState := instance.State.Steps[step.ID]
 	if err := e.markStepRunning(ctx, instance, step.ID, attempt, workflow.InstanceRunning); err != nil {
 		return fmt.Errorf("mark step running: %w", err)
 	}
@@ -173,7 +214,7 @@ func (e *Engine) executeNormalStep(ctx context.Context, instance *store.Instance
 	}
 
 	start := time.Now()
-	result, execErr := e.executeWithSpan(ctx, instance, definition, step)
+	result, execErr := e.executeWithSpan(ctx, instance, definition, step, previousStepState)
 	duration := time.Since(start)
 	if execErr == nil {
 		e.metrics.ObserveStep(step.Type, "success", duration)
@@ -217,7 +258,7 @@ func (e *Engine) advanceCompensation(ctx context.Context, instance *store.Instan
 	}
 
 	start := time.Now()
-	result, execErr := e.executeWithSpan(ctx, instance, definition, step)
+	result, execErr := e.executeWithSpan(ctx, instance, definition, step, workflow.StepState{})
 	duration := time.Since(start)
 	if execErr == nil {
 		e.metrics.ObserveStep(step.Type, "success", duration)
@@ -273,7 +314,7 @@ func (e *Engine) markStepRunning(ctx context.Context, instance *store.Instance, 
 	return nil
 }
 
-func (e *Engine) executeWithSpan(ctx context.Context, instance *store.Instance, definition *store.Definition, step workflow.Step) (*worker.Result, error) {
+func (e *Engine) executeWithSpan(ctx context.Context, instance *store.Instance, definition *store.Definition, step workflow.Step, previousStepState workflow.StepState) (*worker.Result, error) {
 	tracer := otel.Tracer("aetherflow/internal/engine")
 	spanCtx, span := tracer.Start(ctx, "workflow.step")
 	defer span.End()
@@ -284,6 +325,20 @@ func (e *Engine) executeWithSpan(ctx context.Context, instance *store.Instance, 
 		attribute.String("workflow.step_id", step.ID),
 		attribute.String("workflow.step_type", step.Type),
 	)
+	if step.Type == workflow.StepDelay && previousStepState.Status == workflow.StepWaitingTimer {
+		waitingTime := previousStepState.WaitingTime
+		if waitingTime == nil || !waitingTime.After(time.Now().UTC()) {
+			return &worker.Result{
+				Output: map[string]any{"fired_at": time.Now().UTC().Format(time.RFC3339Nano)},
+				Body:   map[string]any{"fired": true},
+			}, nil
+		}
+		return &worker.Result{
+			Output:     map[string]any{"fire_at": waitingTime.Format(time.RFC3339Nano)},
+			Body:       map[string]any{"waiting": true},
+			DelayUntil: waitingTime,
+		}, worker.WaitingTimerError{FireAt: *waitingTime}
+	}
 	return e.executor.Execute(spanCtx, instance, step)
 }
 
@@ -384,6 +439,14 @@ func (e *Engine) handleStepFailure(ctx context.Context, instance *store.Instance
 		fireAt := time.Now().UTC().Add(step.Retry.Backoff(attempt))
 		instance.Status = workflow.InstanceWaitingTimer
 		instance.CurrentStepID = &step.ID
+		instance.State.Steps[step.ID] = workflow.StepState{
+			Status:      workflow.StepWaitingTimer,
+			Output:      map[string]any{"fire_at": fireAt.Format(time.RFC3339Nano)},
+			Body:        body,
+			Error:       errText,
+			Attempt:     attempt,
+			WaitingTime: &fireAt,
+		}
 		expected := instance.Version
 		if err := e.repo.UpdateInstance(ctx, instance, expected); err != nil {
 			return fmt.Errorf("update retry wait state: %w", err)
@@ -433,16 +496,18 @@ func (e *Engine) finishInstance(ctx context.Context, instance *store.Instance, s
 }
 
 func (e *Engine) consume(ctx context.Context, workerID int) {
+	consumerName := e.consumer + "-" + strconv.Itoa(workerID)
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		default:
 		}
+		e.reclaimPending(ctx, consumerName)
 		readCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		streams, err := e.redis.XReadGroup(readCtx, &redis.XReadGroupArgs{
 			Group:    e.group,
-			Consumer: e.consumer + "-" + strconv.Itoa(workerID),
+			Consumer: consumerName,
 			Streams:  []string{e.stream, ">"},
 			Count:    10,
 			Block:    5 * time.Second,
@@ -457,20 +522,54 @@ func (e *Engine) consume(ctx context.Context, workerID int) {
 		}
 		for _, stream := range streams {
 			for _, message := range stream.Messages {
-				instanceID := fmt.Sprint(message.Values["instance_id"])
-				if instanceID == "" || instanceID == "<nil>" {
-					e.logger.Error("redis task missing instance_id", "message_id", message.ID)
-					_ = e.ack(ctx, message.ID)
-					continue
-				}
-				if err := e.Advance(ctx, instanceID); err != nil {
-					e.logger.Error("advance workflow instance", "instance_id", instanceID, "error", err)
-				}
-				if err := e.ack(ctx, message.ID); err != nil {
-					e.logger.Error("ack redis task", "message_id", message.ID, "error", err)
-				}
+				e.processMessage(ctx, message)
 			}
 		}
+	}
+}
+
+func (e *Engine) reclaimPending(ctx context.Context, consumerName string) {
+	queryCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	messages, _, err := e.redis.XAutoClaim(queryCtx, &redis.XAutoClaimArgs{
+		Stream:   e.stream,
+		Group:    e.group,
+		Consumer: consumerName,
+		MinIdle:  e.pendingIdle,
+		Start:    "0-0",
+		Count:    10,
+	}).Result()
+	if err != nil {
+		if errors.Is(err, redis.Nil) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return
+		}
+		e.logger.Error("reclaim redis pending messages", "consumer", consumerName, "error", err)
+		return
+	}
+	for _, message := range messages {
+		e.processMessage(ctx, message)
+	}
+}
+
+func (e *Engine) processMessage(ctx context.Context, message redis.XMessage) {
+	instanceID := fmt.Sprint(message.Values["instance_id"])
+	if instanceID == "" || instanceID == "<nil>" {
+		e.logger.Error("redis task missing instance_id", "message_id", message.ID)
+		_ = e.ack(ctx, message.ID)
+		return
+	}
+	if err := e.Advance(ctx, instanceID); err != nil {
+		if errors.Is(err, store.ErrInstanceBusy) {
+			if ackErr := e.ack(ctx, message.ID); ackErr != nil {
+				e.logger.Error("ack duplicate redis task", "message_id", message.ID, "error", ackErr)
+			}
+			return
+		}
+		e.logger.Error("advance workflow instance", "instance_id", instanceID, "message_id", message.ID, "error", err)
+		return
+	}
+	if err := e.ack(ctx, message.ID); err != nil {
+		e.logger.Error("ack redis task", "message_id", message.ID, "error", err)
 	}
 }
 
@@ -506,6 +605,10 @@ func (e *Engine) ack(ctx context.Context, messageID string) error {
 		return fmt.Errorf("ack redis stream message: %w", err)
 	}
 	return nil
+}
+
+func (e *Engine) nextClaimOwner() string {
+	return e.consumer + "-claim-" + strconv.FormatUint(e.claimSeq.Add(1), 10)
 }
 
 func isTerminal(status string) bool {

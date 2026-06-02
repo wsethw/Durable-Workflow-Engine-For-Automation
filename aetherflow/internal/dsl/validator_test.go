@@ -80,3 +80,17 @@ func TestValidatorRejectsUnknownFailureReference(t *testing.T) {
 		t.Fatal("expected unknown reference validation error")
 	}
 }
+
+func TestValidatorRejectsPrivateHTTPRequestURL(t *testing.T) {
+	definition := workflow.DefinitionDSL{
+		Name:    "ssrf",
+		Version: 1,
+		Steps: []workflow.Step{
+			{ID: "private", Type: workflow.StepHTTPRequest, Config: map[string]any{"url": "http://localhost:8080/admin", "method": "GET"}},
+		},
+	}
+
+	if err := NewValidator().Validate(context.Background(), definition); err == nil {
+		t.Fatal("expected private URL validation error")
+	}
+}

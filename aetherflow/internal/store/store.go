@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/aetherflow/aetherflow/internal/workflow"
@@ -9,6 +10,7 @@ import (
 
 type Definition struct {
 	ID        string
+	TenantID  string
 	Name      string
 	Version   int
 	DSL       workflow.DefinitionDSL
@@ -18,6 +20,7 @@ type Definition struct {
 
 type Instance struct {
 	ID                string
+	TenantID          string
 	DefinitionID      string
 	DefinitionVersion int
 	Status            string
@@ -50,10 +53,14 @@ type Timer struct {
 
 type Repository interface {
 	Ping(ctx context.Context) error
-	CreateDefinition(ctx context.Context, dsl workflow.DefinitionDSL) (*Definition, error)
+	CreateDefinition(ctx context.Context, tenantID string, dsl workflow.DefinitionDSL) (*Definition, error)
 	GetDefinition(ctx context.Context, id string) (*Definition, error)
-	CreateInstance(ctx context.Context, definition *Definition, input map[string]any) (*Instance, error)
+	GetDefinitionForTenant(ctx context.Context, tenantID string, id string) (*Definition, error)
+	CreateInstance(ctx context.Context, tenantID string, definition *Definition, input map[string]any) (*Instance, error)
 	GetInstance(ctx context.Context, id string) (*Instance, error)
+	GetInstanceForTenant(ctx context.Context, tenantID string, id string) (*Instance, error)
+	ClaimInstance(ctx context.Context, id string, owner string, leaseUntil time.Time) (*Instance, error)
+	ReleaseInstance(ctx context.Context, id string, owner string) error
 	ListRecoverableInstances(ctx context.Context, limit int) ([]Instance, error)
 	UpdateInstance(ctx context.Context, instance *Instance, expectedVersion int) error
 	AppendHistory(ctx context.Context, history *History) (*History, error)
@@ -61,5 +68,9 @@ type Repository interface {
 	ListHistory(ctx context.Context, instanceID string) ([]History, error)
 	UpsertTimer(ctx context.Context, timer Timer) error
 	DeleteTimer(ctx context.Context, instanceID string) error
+	FireTimer(ctx context.Context, instanceID string) (*Timer, bool, error)
 	ListDueTimers(ctx context.Context, now time.Time, limit int) ([]Timer, error)
+	ClaimDueTimers(ctx context.Context, now time.Time, limit int) ([]Timer, error)
 }
+
+var ErrInstanceBusy = errors.New("instance is owned by another worker")

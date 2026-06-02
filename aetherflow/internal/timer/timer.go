@@ -123,25 +123,31 @@ func (s *Service) Run(ctx context.Context) error {
 }
 
 func (s *Service) poll(ctx context.Context) error {
-	due, err := s.repo.ListDueTimers(ctx, time.Now().UTC(), s.pollLimit)
+	due, err := s.repo.ClaimDueTimers(ctx, time.Now().UTC(), s.pollLimit)
 	if err != nil {
-		return fmt.Errorf("list due timers: %w", err)
+		return fmt.Errorf("claim due timers: %w", err)
 	}
 	for _, timer := range due {
-		if err := s.fire(ctx, timer.InstanceID); err != nil {
-			return fmt.Errorf("fire due timer %s: %w", timer.InstanceID, err)
+		if err := s.clearRedisKey(ctx, timer.InstanceID); err != nil {
+			return fmt.Errorf("clear due timer key %s: %w", timer.InstanceID, err)
+		}
+		if s.enqueue == nil {
+			continue
+		}
+		if err := s.enqueue(ctx, timer.InstanceID); err != nil {
+			return fmt.Errorf("enqueue due timer %s: %w", timer.InstanceID, err)
 		}
 	}
 	return nil
 }
 
 func (s *Service) fire(ctx context.Context, instanceID string) error {
-	if err := s.repo.DeleteTimer(ctx, instanceID); err != nil {
-		return fmt.Errorf("delete fired timer: %w", err)
+	if _, ok, err := s.repo.FireTimer(ctx, instanceID); err != nil {
+		return fmt.Errorf("claim fired timer: %w", err)
+	} else if !ok {
+		return s.clearRedisKey(ctx, instanceID)
 	}
-	queryCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	defer cancel()
-	if err := s.redis.Del(queryCtx, s.key(instanceID)).Err(); err != nil {
+	if err := s.clearRedisKey(ctx, instanceID); err != nil {
 		return fmt.Errorf("delete fired redis key: %w", err)
 	}
 	if s.enqueue == nil {
@@ -149,6 +155,15 @@ func (s *Service) fire(ctx context.Context, instanceID string) error {
 	}
 	if err := s.enqueue(ctx, instanceID); err != nil {
 		return fmt.Errorf("enqueue fired timer: %w", err)
+	}
+	return nil
+}
+
+func (s *Service) clearRedisKey(ctx context.Context, instanceID string) error {
+	queryCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	if err := s.redis.Del(queryCtx, s.key(instanceID)).Err(); err != nil {
+		return fmt.Errorf("delete redis timer key: %w", err)
 	}
 	return nil
 }
