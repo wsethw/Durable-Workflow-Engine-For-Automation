@@ -63,6 +63,15 @@ func (v Validator) Validate(ctx context.Context, definition workflow.DefinitionD
 				return fmt.Errorf("validate workflow: step %q on_failure references unknown step %q", step.ID, step.OnFailure)
 			}
 		}
+		if step.Type == workflow.StepFork {
+			joinStepID, _ := stringValue(step.Config, "join")
+			if joinStepID == "" {
+				joinStepID = firstJoinAfter(definition, step.ID)
+			}
+			if joinStepID == "" {
+				return fmt.Errorf("validate workflow: fork step %q requires config.join or a later join step", step.ID)
+			}
+		}
 		for _, ref := range explicitRefs(step) {
 			if _, ok := ids[ref]; !ok {
 				return fmt.Errorf("validate workflow: step %q references unknown step %q", step.ID, ref)
@@ -176,9 +185,13 @@ func (v Validator) validateStep(step workflow.Step) error {
 func validateAcyclic(definition workflow.DefinitionDSL, ids map[string]int) error {
 	edges := make(map[string][]string, len(definition.Steps))
 	compensation := definition.CompensationRefs()
+	branchSteps := collectForkBranchSteps(definition)
 	normalSteps := make([]workflow.Step, 0, len(definition.Steps))
 	for _, step := range definition.Steps {
 		if _, isCompensation := compensation[step.ID]; !isCompensation {
+			if _, isBranch := branchSteps[step.ID]; isBranch {
+				continue
+			}
 			normalSteps = append(normalSteps, step)
 		}
 	}
@@ -229,6 +242,9 @@ func validateAcyclic(definition workflow.DefinitionDSL, ids map[string]int) erro
 
 func explicitRefs(step workflow.Step) []string {
 	refs := make([]string, 0, 4)
+	if next, ok := stringValue(step.Config, "next"); ok && next != "" {
+		refs = append(refs, next)
+	}
 	switch step.Type {
 	case workflow.StepCondition:
 		if thenRef, ok := stringValue(step.Config, "then"); ok && thenRef != "" {
@@ -241,12 +257,73 @@ func explicitRefs(step workflow.Step) []string {
 		if branches, ok := stringSliceValue(step.Config, "branches"); ok {
 			refs = append(refs, branches...)
 		}
-	case workflow.StepJoin:
-		if next, ok := stringValue(step.Config, "next"); ok && next != "" {
-			refs = append(refs, next)
+		if join, ok := stringValue(step.Config, "join"); ok && join != "" {
+			refs = append(refs, join)
 		}
+	case workflow.StepJoin:
 	}
 	return refs
+}
+
+func collectForkBranchSteps(definition workflow.DefinitionDSL) map[string]struct{} {
+	out := make(map[string]struct{})
+	for _, step := range definition.Steps {
+		if step.Type != workflow.StepFork {
+			continue
+		}
+		branches, ok := stringSliceValue(step.Config, "branches")
+		if !ok {
+			continue
+		}
+		joinStepID, _ := stringValue(step.Config, "join")
+		if joinStepID == "" {
+			joinStepID = firstJoinAfter(definition, step.ID)
+		}
+		for _, branch := range branches {
+			collectBranchStep(definition, branch, joinStepID, out, make(map[string]struct{}))
+		}
+	}
+	return out
+}
+
+func collectBranchStep(definition workflow.DefinitionDSL, stepID string, joinStepID string, out map[string]struct{}, seen map[string]struct{}) {
+	if stepID == "" || stepID == joinStepID {
+		return
+	}
+	if _, ok := seen[stepID]; ok {
+		return
+	}
+	seen[stepID] = struct{}{}
+	step, ok := definition.StepByID(stepID)
+	if !ok {
+		return
+	}
+	out[stepID] = struct{}{}
+	if next, ok := stringValue(step.Config, "next"); ok && next != "" {
+		collectBranchStep(definition, next, joinStepID, out, seen)
+	}
+	if step.Type == workflow.StepCondition {
+		if thenRef, ok := stringValue(step.Config, "then"); ok && thenRef != "" {
+			collectBranchStep(definition, thenRef, joinStepID, out, seen)
+		}
+		if elseRef, ok := stringValue(step.Config, "else"); ok && elseRef != "" {
+			collectBranchStep(definition, elseRef, joinStepID, out, seen)
+		}
+	}
+}
+
+func firstJoinAfter(definition workflow.DefinitionDSL, stepID string) string {
+	found := false
+	for _, step := range definition.Steps {
+		if step.ID == stepID {
+			found = true
+			continue
+		}
+		if found && step.Type == workflow.StepJoin {
+			return step.ID
+		}
+	}
+	return ""
 }
 
 func defaultExprEnv() map[string]any {

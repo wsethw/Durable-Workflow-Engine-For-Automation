@@ -100,16 +100,32 @@ type RuntimeState struct {
 	Steps             map[string]StepState `json:"steps"`
 	Completed         []string             `json:"completed"`
 	CompensationQueue []string             `json:"compensation_queue,omitempty"`
+	Forks             map[string]ForkState `json:"forks,omitempty"`
 	StartedAt         time.Time            `json:"started_at,omitempty"`
 }
 
 type StepState struct {
-	Status      string         `json:"status"`
-	Body        any            `json:"body,omitempty"`
-	Output      map[string]any `json:"output,omitempty"`
-	Error       string         `json:"error,omitempty"`
-	Attempt     int            `json:"attempt"`
-	WaitingTime *time.Time     `json:"waiting_time,omitempty"`
+	Status         string         `json:"status"`
+	Body           any            `json:"body,omitempty"`
+	Output         map[string]any `json:"output,omitempty"`
+	Error          string         `json:"error,omitempty"`
+	Attempt        int            `json:"attempt"`
+	IdempotencyKey string         `json:"idempotency_key,omitempty"`
+	WaitingTime    *time.Time     `json:"waiting_time,omitempty"`
+}
+
+type ForkState struct {
+	Status     string        `json:"status"`
+	JoinStepID string        `json:"join_step_id"`
+	Branches   []BranchState `json:"branches"`
+}
+
+type BranchState struct {
+	StartStepID   string   `json:"start_step_id"`
+	CurrentStepID string   `json:"current_step_id,omitempty"`
+	Status        string   `json:"status"`
+	Completed     []string `json:"completed,omitempty"`
+	Error         string   `json:"error,omitempty"`
 }
 
 func NewRuntimeState() RuntimeState {

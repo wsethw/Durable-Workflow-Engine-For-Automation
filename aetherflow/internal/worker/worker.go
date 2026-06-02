@@ -64,8 +64,25 @@ func NewExecutorWithOptions(options ExecutorOptions) *Executor {
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: defaultHTTPTimeout}
 	}
+	configuredClient := *httpClient
+	httpClient = &configuredClient
 	if httpClient.Timeout <= 0 {
 		httpClient.Timeout = defaultHTTPTimeout
+	}
+	previousRedirectPolicy := httpClient.CheckRedirect
+	httpClient.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if previousRedirectPolicy != nil {
+			if err := previousRedirectPolicy(req, via); err != nil {
+				return err
+			}
+		}
+		if len(via) >= 5 {
+			return fmt.Errorf("too many http_request redirects")
+		}
+		if err := security.EnsureHTTPDestinationAllowed(req.Context(), req.URL.String(), options.AllowPrivateNetworks); err != nil {
+			return fmt.Errorf("validate http_request redirect destination: %w", err)
+		}
+		return nil
 	}
 	if options.MaxRequestBytes <= 0 {
 		options.MaxRequestBytes = defaultMaxRequestBytes
@@ -95,7 +112,7 @@ func (e *Executor) Execute(ctx context.Context, instance *store.Instance, step w
 	case workflow.StepFork:
 		return e.executeFork(ctx, step)
 	case workflow.StepJoin:
-		return &Result{Output: map[string]any{"joined": true}, Body: map[string]any{"joined": true}}, nil
+		return e.executeJoin(ctx, step)
 	default:
 		return nil, fmt.Errorf("execute step %q: unsupported step type %q", step.ID, step.Type)
 	}
@@ -299,7 +316,27 @@ func (e *Executor) executeFork(ctx context.Context, step workflow.Step) (*Result
 	}
 	next := branches[0]
 	output := map[string]any{"branches": branches, "next_step": next}
+	if join, ok := stringValue(step.Config, "join"); ok && join != "" {
+		output["join_step"] = join
+	}
 	return &Result{Output: output, Body: output, NextStepID: &next}, nil
+}
+
+func (e *Executor) executeJoin(ctx context.Context, step workflow.Step) (*Result, error) {
+	select {
+	case <-ctx.Done():
+		return nil, fmt.Errorf("execute join context: %w", ctx.Err())
+	default:
+	}
+	output := map[string]any{"joined": true}
+	if branches, ok := stringSliceValue(step.Config, "branches"); ok {
+		output["branches"] = branches
+	}
+	if next, ok := stringValue(step.Config, "next"); ok && next != "" {
+		output["next_step"] = next
+		return &Result{Output: output, Body: output, NextStepID: &next}, nil
+	}
+	return &Result{Output: output, Body: output}, nil
 }
 
 func BuildEnv(input map[string]any, state workflow.RuntimeState) map[string]any {
@@ -307,11 +344,12 @@ func BuildEnv(input map[string]any, state workflow.RuntimeState) map[string]any 
 	steps := make(map[string]any, len(state.Steps))
 	for stepID, stepState := range state.Steps {
 		steps[stepID] = map[string]any{
-			"status":  stepState.Status,
-			"body":    stepState.Body,
-			"output":  stepState.Output,
-			"error":   stepState.Error,
-			"attempt": stepState.Attempt,
+			"status":          stepState.Status,
+			"body":            stepState.Body,
+			"output":          stepState.Output,
+			"error":           stepState.Error,
+			"attempt":         stepState.Attempt,
+			"idempotency_key": stepState.IdempotencyKey,
 		}
 	}
 	return map[string]any{
@@ -320,6 +358,7 @@ func BuildEnv(input map[string]any, state workflow.RuntimeState) map[string]any 
 		"state": map[string]any{
 			"completed":          state.Completed,
 			"compensation_queue": state.CompensationQueue,
+			"forks":              state.Forks,
 		},
 	}
 }

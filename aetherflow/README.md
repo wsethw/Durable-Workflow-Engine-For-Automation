@@ -27,6 +27,10 @@ API authentication is enabled when `API_KEYS` is set. Use comma-separated entrie
 `token=tenant_id:role`, where role is `admin`, `operator`, or `reader`. When `API_KEYS` is empty,
 the service runs in local development mode as `default/admin`.
 
+Authorization is tenant-scoped. Definitions, instances, and execution history are read and written
+through the tenant attached to the API key. Readers can inspect instances, operators can start
+instances, and only admins can create definitions.
+
 ## Example
 
 Create a definition:
@@ -121,6 +125,42 @@ curl -sS http://localhost:8080/instances/<instance_id>
 
 Each step is recorded as `running` before execution. Outputs and instance state are persisted before the next task is enqueued. On restart, workers consume the durable Redis stream and rehydrate instance state from PostgreSQL; the recovery loop also re-enqueues instances left in `running` or `waiting_timer`.
 
+When a step is marked `running`, AetherFlow generates and persists `steps.<step_id>.idempotency_key`
+in the execution environment. External systems should use that value as their idempotency token.
+If a side effect succeeds but saving the final `completed` state fails, recovery retries the same
+logical step with the same token.
+
 Retries use per-step exponential backoff. A step with `on_failure` runs compensation steps in reverse completion order when the normal path cannot recover. Definition updates are versioned by `(name, version)`, and instances keep `definition_version`, so in-flight executions remain tied to their original definition snapshot.
 
 Distributed workers claim instances through PostgreSQL leases before advancing state. Redis Stream messages are acknowledged only after a successful transition or a confirmed duplicate claim, and stale pending messages are reclaimed with `XAUTOCLAIM`. Durable timers are claimed atomically before enqueueing to avoid duplicate wakeups. HTTP workflow steps reject local/private destinations by default; set `ALLOW_PRIVATE_HTTP=true` only for trusted internal deployments.
+
+HTTP requests validate the initial URL and every redirect target. Userinfo, non-HTTP schemes,
+loopback, link-local, multicast, private, and locally resolved addresses are rejected unless
+`ALLOW_PRIVATE_HTTP=true`.
+
+## Fork/Join
+
+`fork` and `join` are durable state-machine operations. A `fork` step declares branch start steps
+and either a `join` step or a later `join` step in the definition. Branch steps are excluded from
+the normal linear path, persisted in `state.forks`, and advanced one branch at a time by the engine.
+The `join` step runs only after every branch in the fork has completed.
+
+Use `config.next` to chain more than one step inside a branch:
+
+```json
+{
+  "name": "Fanout Example",
+  "version": 1,
+  "steps": [
+    {"id": "fanout", "type": "fork", "config": {"branches": ["reserve_a", "reserve_b"], "join": "join_reservations"}},
+    {"id": "reserve_a", "type": "transform", "config": {"expr": "input.a", "next": "audit_a"}},
+    {"id": "audit_a", "type": "transform", "config": {"expr": "steps.reserve_a.output.result"}},
+    {"id": "reserve_b", "type": "transform", "config": {"expr": "input.b"}},
+    {"id": "join_reservations", "type": "join", "config": {"next": "notify"}},
+    {"id": "notify", "type": "transform", "config": {"expr": "'done'"}}
+  ]
+}
+```
+
+If a branch fails after retries, the fork state records the failed branch and the normal failure path
+continues, including compensation when `on_failure` is configured.

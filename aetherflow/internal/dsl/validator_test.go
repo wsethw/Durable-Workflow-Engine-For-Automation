@@ -94,3 +94,22 @@ func TestValidatorRejectsPrivateHTTPRequestURL(t *testing.T) {
 		t.Fatal("expected private URL validation error")
 	}
 }
+
+func TestValidatorAcceptsForkJoinWithExplicitBranchNext(t *testing.T) {
+	definition := workflow.DefinitionDSL{
+		Name:    "fork-join",
+		Version: 1,
+		Steps: []workflow.Step{
+			{ID: "fanout", Type: workflow.StepFork, Config: map[string]any{"branches": []any{"a1", "b1"}, "join": "join"}},
+			{ID: "a1", Type: workflow.StepTransform, Config: map[string]any{"expr": "1", "next": "a2"}},
+			{ID: "a2", Type: workflow.StepTransform, Config: map[string]any{"expr": "2"}},
+			{ID: "b1", Type: workflow.StepTransform, Config: map[string]any{"expr": "3"}},
+			{ID: "join", Type: workflow.StepJoin, Config: map[string]any{"next": "notify"}},
+			{ID: "notify", Type: workflow.StepTransform, Config: map[string]any{"expr": "4"}},
+		},
+	}
+
+	if err := NewValidator().Validate(context.Background(), definition); err != nil {
+		t.Fatalf("expected valid fork/join definition, got %v", err)
+	}
+}

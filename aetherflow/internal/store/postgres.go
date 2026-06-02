@@ -453,6 +453,39 @@ func (p *Postgres) ListHistory(ctx context.Context, instanceID string) ([]Histor
 	return history, nil
 }
 
+func (p *Postgres) ListHistoryForTenant(ctx context.Context, tenantID string, instanceID string) ([]History, error) {
+	queryCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if tenantID == "" {
+		tenantID = "default"
+	}
+
+	rows, err := p.pool.Query(queryCtx, `
+		SELECT h.id, h.instance_id, h.step_id, h.status, h.input, h.output, h.error, h.attempt, h.started_at, h.completed_at
+		FROM execution_history h
+		JOIN instances i ON i.id = h.instance_id
+		WHERE i.tenant_id = $1 AND h.instance_id = $2
+		ORDER BY h.started_at ASC
+	`, tenantID, instanceID)
+	if err != nil {
+		return nil, fmt.Errorf("select tenant execution history: %w", err)
+	}
+	defer rows.Close()
+
+	history := make([]History, 0)
+	for rows.Next() {
+		item, err := scanHistory(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan tenant execution history: %w", err)
+		}
+		history = append(history, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate tenant execution history: %w", err)
+	}
+	return history, nil
+}
+
 func (p *Postgres) UpsertTimer(ctx context.Context, timer Timer) error {
 	queryCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()

@@ -66,6 +66,7 @@ type Repository interface {
 	AppendHistory(ctx context.Context, history *History) (*History, error)
 	CompleteHistory(ctx context.Context, historyID string, status string, output map[string]any, stepErr *string) error
 	ListHistory(ctx context.Context, instanceID string) ([]History, error)
+	ListHistoryForTenant(ctx context.Context, tenantID string, instanceID string) ([]History, error)
 	UpsertTimer(ctx context.Context, timer Timer) error
 	DeleteTimer(ctx context.Context, instanceID string) error
 	FireTimer(ctx context.Context, instanceID string) (*Timer, bool, error)

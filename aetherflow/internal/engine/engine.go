@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -159,7 +160,7 @@ func (e *Engine) Advance(ctx context.Context, instanceID string) error {
 		return err
 	}
 
-	definition, err := e.repo.GetDefinition(ctx, instance.DefinitionID)
+	definition, err := e.repo.GetDefinitionForTenant(ctx, instance.TenantID, instance.DefinitionID)
 	if err != nil {
 		return fmt.Errorf("get definition for advance: %w", err)
 	}
@@ -271,7 +272,8 @@ func (e *Engine) advanceCompensation(ctx context.Context, instance *store.Instan
 		if err := e.repo.CompleteHistory(ctx, history.ID, "compensated", output, nil); err != nil {
 			return fmt.Errorf("complete compensation history: %w", err)
 		}
-		instance.State.MarkCompleted(step.ID, workflow.StepState{Status: workflow.StepCompleted, Output: output, Body: body, Attempt: attempt})
+		idempotencyKey := instance.State.Steps[step.ID].IdempotencyKey
+		instance.State.MarkCompleted(step.ID, workflow.StepState{Status: workflow.StepCompleted, Output: output, Body: body, Attempt: attempt, IdempotencyKey: idempotencyKey})
 		instance.State.CompensationQueue = instance.State.CompensationQueue[1:]
 		if len(instance.State.CompensationQueue) == 0 {
 			return e.finishInstance(ctx, instance, workflow.InstanceFailed, nil)
@@ -306,7 +308,16 @@ func (e *Engine) markStepRunning(ctx context.Context, instance *store.Instance, 
 	instance.State.Normalize()
 	instance.Status = status
 	instance.CurrentStepID = &stepID
-	instance.State.Steps[stepID] = workflow.StepState{Status: workflow.StepRunning, Attempt: attempt}
+	previous := instance.State.Steps[stepID]
+	idempotencyKey := previous.IdempotencyKey
+	if idempotencyKey == "" {
+		idempotencyKey = uuid.NewString()
+	}
+	instance.State.Steps[stepID] = workflow.StepState{
+		Status:         workflow.StepRunning,
+		Attempt:        attempt,
+		IdempotencyKey: idempotencyKey,
+	}
 	expected := instance.Version
 	if err := e.repo.UpdateInstance(ctx, instance, expected); err != nil {
 		return fmt.Errorf("update running state: %w", err)
@@ -352,14 +363,15 @@ func (e *Engine) handleStepSuccess(ctx context.Context, instance *store.Instance
 	if err := e.repo.CompleteHistory(ctx, historyID, "success", output, nil); err != nil {
 		return fmt.Errorf("complete successful history: %w", err)
 	}
-	instance.State.MarkCompleted(step.ID, workflow.StepState{Status: workflow.StepCompleted, Output: output, Body: body, Attempt: attempt})
+	idempotencyKey := instance.State.Steps[step.ID].IdempotencyKey
+	instance.State.MarkCompleted(step.ID, workflow.StepState{Status: workflow.StepCompleted, Output: output, Body: body, Attempt: attempt, IdempotencyKey: idempotencyKey})
 	if e.timers != nil {
 		if err := e.timers.Clear(ctx, instance.ID); err != nil {
 			return fmt.Errorf("clear durable timer: %w", err)
 		}
 	}
 
-	next, ok := machine.NextAfter(step, instance.State, result)
+	next, ok := machine.NextAfter(step, &instance.State, result)
 	expected := instance.Version
 	if !ok {
 		instance.Status = workflow.InstanceCompleted
@@ -396,11 +408,12 @@ func (e *Engine) handleStepWaiting(ctx context.Context, instance *store.Instance
 	}
 	instance.Status = workflow.InstanceWaitingTimer
 	instance.State.Steps[step.ID] = workflow.StepState{
-		Status:      workflow.StepWaitingTimer,
-		Output:      output,
-		Body:        body,
-		Attempt:     attempt,
-		WaitingTime: &fireAt,
+		Status:         workflow.StepWaitingTimer,
+		Output:         output,
+		Body:           body,
+		Attempt:        attempt,
+		IdempotencyKey: instance.State.Steps[step.ID].IdempotencyKey,
+		WaitingTime:    &fireAt,
 	}
 	instance.CurrentStepID = &step.ID
 	expected := instance.Version
@@ -428,24 +441,27 @@ func (e *Engine) handleStepFailure(ctx context.Context, instance *store.Instance
 		return fmt.Errorf("complete failed history: %w", err)
 	}
 	instance.State.Steps[step.ID] = workflow.StepState{
-		Status:  workflow.StepFailed,
-		Output:  output,
-		Body:    body,
-		Error:   errText,
-		Attempt: attempt,
+		Status:         workflow.StepFailed,
+		Output:         output,
+		Body:           body,
+		Error:          errText,
+		Attempt:        attempt,
+		IdempotencyKey: instance.State.Steps[step.ID].IdempotencyKey,
 	}
 
 	if step.Retry != nil && attempt <= step.Retry.MaxRetries {
 		fireAt := time.Now().UTC().Add(step.Retry.Backoff(attempt))
+		idempotencyKey := instance.State.Steps[step.ID].IdempotencyKey
 		instance.Status = workflow.InstanceWaitingTimer
 		instance.CurrentStepID = &step.ID
 		instance.State.Steps[step.ID] = workflow.StepState{
-			Status:      workflow.StepWaitingTimer,
-			Output:      map[string]any{"fire_at": fireAt.Format(time.RFC3339Nano)},
-			Body:        body,
-			Error:       errText,
-			Attempt:     attempt,
-			WaitingTime: &fireAt,
+			Status:         workflow.StepWaitingTimer,
+			Output:         map[string]any{"fire_at": fireAt.Format(time.RFC3339Nano)},
+			Body:           body,
+			Error:          errText,
+			Attempt:        attempt,
+			IdempotencyKey: idempotencyKey,
+			WaitingTime:    &fireAt,
 		}
 		expected := instance.Version
 		if err := e.repo.UpdateInstance(ctx, instance, expected); err != nil {
@@ -460,6 +476,7 @@ func (e *Engine) handleStepFailure(ctx context.Context, instance *store.Instance
 		return nil
 	}
 
+	machine.MarkBranchFailed(&instance.State, step.ID, execErr)
 	queue := machine.CompensationQueue(step.ID, instance.State)
 	if len(queue) > 0 {
 		instance.State.CompensationQueue = queue

@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -149,4 +150,58 @@ func TestHTTPRequestBlocksPrivateNetworkByDefault(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected private network validation error")
 	}
+}
+
+func TestHTTPRequestBlocksPrivateRedirectByDefault(t *testing.T) {
+	client := &http.Client{
+		Timeout: time.Second,
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			if req.URL.Host == "93.184.216.34" {
+				return &http.Response{
+					StatusCode: http.StatusFound,
+					Header:     http.Header{"Location": []string{"http://127.0.0.1/admin"}},
+					Body:       io.NopCloser(http.NoBody),
+					Request:    req,
+				}, nil
+			}
+			t.Fatalf("unexpected redirected request to %s", req.URL.String())
+			return nil, nil
+		}),
+	}
+	instance := &store.Instance{Input: map[string]any{}, State: workflow.NewRuntimeState()}
+	step := workflow.Step{
+		ID:   "redirect",
+		Type: workflow.StepHTTPRequest,
+		Config: map[string]any{
+			"url":    "http://93.184.216.34/start",
+			"method": "GET",
+		},
+	}
+
+	_, err := NewExecutorWithOptions(ExecutorOptions{HTTPClient: client}).Execute(context.Background(), instance, step)
+	if err == nil {
+		t.Fatal("expected private redirect validation error")
+	}
+}
+
+func TestBuildEnvExposesIdempotencyKey(t *testing.T) {
+	state := workflow.NewRuntimeState()
+	state.Steps["charge"] = workflow.StepState{
+		Status:         workflow.StepRunning,
+		Attempt:        1,
+		IdempotencyKey: "idem-123",
+	}
+
+	env := BuildEnv(map[string]any{}, state)
+	steps := env["steps"].(map[string]any)
+	charge := steps["charge"].(map[string]any)
+	if charge["idempotency_key"] != "idem-123" {
+		t.Fatalf("expected idempotency key in env, got %#v", charge["idempotency_key"])
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
 }

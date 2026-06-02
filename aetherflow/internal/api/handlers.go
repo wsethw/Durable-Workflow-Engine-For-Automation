@@ -148,7 +148,7 @@ func (h *Handler) getInstance(c *gin.Context) {
 		c.JSON(status, gin.H{"error": err.Error()})
 		return
 	}
-	history, err := h.repo.ListHistory(c.Request.Context(), instanceID)
+	history, err := h.repo.ListHistoryForTenant(c.Request.Context(), principal.TenantID, instanceID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
